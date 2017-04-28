@@ -2,14 +2,14 @@ from models import Experiment, Alternative, Client
 from config import CONFIG as cfg
 
 
-def participate(experiment, alternatives, client_id,
+def participate(api_key, experiment, alternatives, client_id,
     force=None,
     traffic_fraction=None,
     prefetch=False,
     datetime=None,
     redis=None):
 
-    exp = Experiment.find_or_create(experiment, alternatives, traffic_fraction=traffic_fraction, redis=redis)
+    exp = Experiment.find_or_create(api_key, experiment, alternatives, traffic_fraction=traffic_fraction, redis=redis)
 
     alt = None
     if force and force in alternatives:
@@ -25,12 +25,12 @@ def participate(experiment, alternatives, client_id,
     return alt
 
 
-def convert(experiment, client_id,
+def convert(api_key, experiment, client_id,
     kpi=None,
     datetime=None,
     redis=None):
 
-    exp = Experiment.find(experiment, redis=redis)
+    exp = Experiment.find(api_key, experiment, redis=redis)
 
     if cfg.get('enabled', True):
         client = Client(client_id, redis=redis)

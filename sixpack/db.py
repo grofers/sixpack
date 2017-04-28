@@ -33,14 +33,16 @@ def _key(k):
     return "{0}:{1}".format(DEFAULT_PREFIX, k)
 
 
-monotonic_zadd = REDIS.register_script("""
+monotonic_zadd_script = """
     local sequential_id = redis.call('zscore', KEYS[1], ARGV[1])
     if not sequential_id then
         sequential_id = redis.call('zcard', KEYS[1])
         redis.call('zadd', KEYS[1], sequential_id, ARGV[1])
     end
     return sequential_id
-""")
+"""
+
+monotonic_zadd = REDIS.register_script(monotonic_zadd_script)
 
 
 def sequential_id(k, identifier):
@@ -49,15 +51,16 @@ def sequential_id(k, identifier):
     return int(monotonic_zadd(keys=[key], args=[identifier]))
 
 
-msetbit = REDIS.register_script("""
+msetbit_script = """
     for index, value in ipairs(KEYS) do
         redis.call('setbit', value, ARGV[(index - 1) * 2 + 1], ARGV[(index - 1) * 2 + 2])
     end
     return redis.status_reply('ok')
-""")
+"""
 
+msetbit = REDIS.register_script(msetbit_script)
 
-first_key_with_bit_set = REDIS.register_script("""
+first_key_with_bit_set_script = """
     for index, value in ipairs(KEYS) do
         local bit = redis.call('getbit', value, ARGV[1])
         if bit == 1 then
@@ -65,4 +68,6 @@ first_key_with_bit_set = REDIS.register_script("""
         end
     end
     return false
-""")
+"""
+
+first_key_with_bit_set = REDIS.register_script(first_key_with_bit_set_script)

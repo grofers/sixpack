@@ -4,14 +4,46 @@ from math import log
 import operator
 import random
 import re
+
 import redis
+import gevent
 
 from config import CONFIG as cfg
-from db import _key, msetbit, sequential_id, first_key_with_bit_set
+from db import _key, msetbit, msetbit_script, monotonic_zadd_script, sequential_id, \
+    first_key_with_bit_set_script, first_key_with_bit_set
 
 # This is pretty restrictive, but we can always relax it later.
 VALID_EXPERIMENT_ALTERNATIVE_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]*$", re.I)
 VALID_KPI_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]*$", re.I)
+
+
+class APIError(Exception):
+
+    def __init__(self, message):
+        self.message = message
+
+    def __str__(self):
+        return self.message
+
+
+class APIKey(object):
+
+    def __init__(self, api_key, redis=None):
+        self.redis = redis
+        self.api_key = api_key
+
+    @classmethod
+    def key_exists(cls, api_key, redis):
+        if not redis.sismember(_key("a"), api_key):
+            raise APIError('API Key does not exists')
+
+    @classmethod
+    def register_key(cls, api_key, redis):
+        redis.sadd(_key('a'), api_key)
+
+    @classmethod
+    def remove_key(cls, api_key, redis):
+        redis.srem(_key('a'), api_key)
 
 
 class Client(object):
@@ -23,15 +55,18 @@ class Client(object):
 
 class Experiment(object):
 
-    def __init__(self, name, alternatives,
+    def __init__(self, api_key, name, alternatives,
         winner=False,
         traffic_fraction=False,
-        redis=None):
+        redis=None, is_archived=False, is_paused=False):
 
         if len(alternatives) < 2:
             raise ValueError('experiments require at least two alternatives')
 
+        self.api_key = api_key
         self.name = name
+        self.name_key = "{0}:{1}".format(api_key, name)
+
         self.redis = redis
         self.alternatives = self.initialize_alternatives(alternatives)
         self.kpi = None
@@ -40,6 +75,8 @@ class Experiment(object):
         self._winner = winner
         self._traffic_fraction = traffic_fraction
         self._sequential_ids = dict()
+        self._is_archived = is_archived
+        self._is_paused = is_paused
 
     def __repr__(self):
         return '<Experiment: {0})>'.format(self.name)
@@ -87,7 +124,7 @@ class Experiment(object):
         try:
             pipe.multi()
             if is_new_record:
-                pipe.sadd(_key('e'), self.name)
+                pipe.sadd(_key('e:{0}'.format(self.api_key)), self.name)
                 pipe.hset(self.key(), 'created_at', datetime.now().strftime("%Y-%m-%d %H:%M"))
                 # reverse here and use lpush to keep consistent with using lrange
                 for alternative in reversed(self.alternatives):
@@ -120,7 +157,7 @@ class Experiment(object):
         return not self.redis.exists(self.key())
 
     def total_participants(self):
-        key = _key("p:{0}:_all:all".format(self.name))
+        key = _key("p:{0}:_all:all".format(self.name_key))
         return self.redis.bitcount(key)
 
     def participants_by_day(self):
@@ -148,7 +185,7 @@ class Experiment(object):
     def _get_stats(self, stat_type, stat_range):
         if stat_type == 'participations':
             stat_type = 'p'
-            exp_key = self.name
+            exp_key = self.name_key
         elif stat_type == 'conversions':
             stat_type = 'c'
             exp_key = self.kpi_key()
@@ -165,7 +202,7 @@ class Experiment(object):
         keys = self.redis.smembers(search_key)
         for k in keys:
             mod = '' if stat_type == 'p' else "users:"
-            range_key = _key("{0}:{1}:_all:{2}{3}".format(stat_type, self.name, mod, k))
+            range_key = _key("{0}:{1}:_all:{2}{3}".format(stat_type, self.name_key, mod, k))
             pipe.bitcount(range_key)
 
         redis_results = pipe.execute()
@@ -190,29 +227,30 @@ class Experiment(object):
 
     def reset(self):
         name = self.name
+        api_key = self.api_key
         desc = self.description
         alts = self.get_alternative_names()
 
         self.delete()
 
-        experiment = Experiment(name, alts, redis=self.redis)
+        experiment = Experiment(api_key, name, alts, redis=self.redis)
         experiment.update_description(desc)
         experiment.save()
 
     def delete(self):
         pipe = self.redis.pipeline()
-        pipe.srem(_key('e'), self.name)
+        pipe.srem(_key('e:{0}'.format(self.api_key)), self.name_key)
         pipe.delete(self.key())
-        pipe.delete(_key(self.name))
-        pipe.delete(_key('e:{0}'.format(self.name)))
+        pipe.delete(_key(self.name_key))
+        pipe.delete(_key('e:{0}'.format(self.name_key)))
 
         # Consider a 'non-keys' implementation of this
-        keys = self.redis.keys('*:{0}:*'.format(self.name))
+        keys = self.redis.keys('*:{0}:*'.format(self.name_key))
         for key in keys:
             pipe.delete(key)
 
         # Delete the KPIs as well
-        kpi_keys = self.redis.keys('*:{0}/*'.format(self.name))
+        kpi_keys = self.redis.keys('*:{0}/*'.format(self.name_key))
         for kpi_key in kpi_keys:
             pipe.delete(kpi_key)
 
@@ -220,10 +258,10 @@ class Experiment(object):
 
     def archive(self):
         self.redis.hset(self.key(), 'archived', 1)
-        self.redis.delete(_key('e:{0}:users'.format(self.name)))
+        self.redis.delete(_key('e:{0}:users'.format(self.name_key)))
 
     def is_archived(self):
-        return self.redis.hexists(self.key(), 'archived')
+        return self._is_archived
 
     def pause(self):
         self.redis.hset(self.key(), 'paused', 1)
@@ -232,7 +270,7 @@ class Experiment(object):
         self.redis.hdel(self.key(), 'paused')
 
     def is_paused(self):
-        return self.redis.hexists(self.key(), 'paused')
+        return self._is_paused
 
     def convert(self, client, dt=None, kpi=None):
         if self.is_archived():
@@ -315,7 +353,7 @@ class Experiment(object):
     def sequential_id(self, client):
         """Return the sequential id for this test for the passed in client"""
         if client.client_id not in self._sequential_ids:
-            id_ = sequential_id("e:{0}:users".format(self.name), client.client_id)
+            id_ = sequential_id("e:{0}:users".format(self.name_key), client.client_id)
             self._sequential_ids[client.client_id] = id_
         return self._sequential_ids[client.client_id]
 
@@ -329,27 +367,47 @@ class Experiment(object):
         if self.is_archived() or self.is_paused():
             return self.control
 
-        if self.is_client_excluded(client):
+        #pipe.eval(monotonic_zadd_script, 1, _key("e:{0}:users".format(self.name_key)), client.client_id)
+
+        self.sequential_id(client)
+
+        alts = self.get_alternative_names()
+        keys = [_key("p:{0}:{1}:all".format(self.name_key, alt)) for alt in alts]
+
+        pipe = self.redis.pipeline()
+        pipe.getbit(_key("e:{0}:excluded".format(self.name_key)), self.sequential_id(client))
+        pipe.eval(first_key_with_bit_set_script, len(keys), *(keys+[self.sequential_id(client)]))
+        results = pipe.execute()
+        is_client_excluded = results[0]
+
+        if is_client_excluded:
             return self.control
 
-        chosen_alternative = self.existing_alternative(client)
+        chosen_alternative = None
+
+        altkey = results[1]
+        if altkey:
+            idx = keys.index(altkey)
+            chosen_alternative = Alternative(alts[idx], self, redis=self.redis)
+
         if not chosen_alternative:
             chosen_alternative, participate = self.choose_alternative(client)
             if participate and not prefetch:
-                chosen_alternative.record_participation(client, dt=dt)
+                gevent.spawn(chosen_alternative.record_participation, client, dt=dt)
+                gevent.sleep(0)
 
         return chosen_alternative
 
     def exclude_client(self, client):
-        key = _key("e:{0}:excluded".format(self.name))
+        key = _key("e:{0}:excluded".format(self.name_key))
         self.redis.setbit(key, self.sequential_id(client), 1)
 
     def is_client_excluded(self, client):
-        key = _key("e:{0}:excluded".format(self.name))
+        key = _key("e:{0}:excluded".format(self.name_key))
         return self.redis.getbit(key, self.sequential_id(client))
 
     def excluded_clients(self):
-        key = _key("e:{0}:excluded".format(self.name))
+        key = _key("e:{0}:excluded".format(self.name_key))
         return self.redis.bitcount(key)
 
     def existing_alternative(self, client):
@@ -357,7 +415,7 @@ class Experiment(object):
             return None
 
         alts = self.get_alternative_names()
-        keys = [_key("p:{0}:{1}:all".format(self.name, alt)) for alt in alts]
+        keys = [_key("p:{0}:{1}:all".format(self.name_key, alt)) for alt in alts]
         altkey = first_key_with_bit_set(keys=keys, args=[self.sequential_id(client)])
         if altkey:
             idx = keys.index(altkey)
@@ -400,29 +458,42 @@ class Experiment(object):
 
     def kpi_key(self):
         if self.kpi is not None:
-            return "{0}/{1}".format(self.name, self.kpi)
+            return "{0}/{1}".format(self.name_key, self.kpi)
         else:
-            return self.name
+            return self.name_key
 
     def key(self, include_kpi=True):
         if include_kpi:
             return _key("e:{0}".format(self.kpi_key()))
         else:
-            return _key("e:{0}".format(self.name))
+            return _key("e:{0}".format(self.name_key))
 
     @classmethod
-    def find(cls, experiment_name,
+    def find(cls, api_key, experiment_name,
         redis=None):
 
-        if not redis.sismember(_key("e"), experiment_name):
+        ekey = "e:{0}:{1}".format(api_key, experiment_name)
+        pipe = redis.pipeline()
+        pipe.sismember(_key("a"), api_key)
+        pipe.sismember(_key("e:{0}".format(api_key)), experiment_name)
+        pipe.lrange(_key("e:{0}:{1}:alternatives".format(api_key, experiment_name)), 0, -1)
+        pipe.hget(_key(ekey), 'traffic_fraction')
+        pipe.get(_key(ekey+':winner'))
+        pipe.hexists(_key(ekey), 'archived')
+        pipe.hexists(_key(ekey), 'paused')
+        results = pipe.execute()
+
+        if not results[0]:
+            raise APIError('API Key does not exists')
+        if not results[1]:
             raise ValueError('experiment does not exist')
 
-        return cls(experiment_name,
-                   Experiment.load_alternatives(experiment_name, redis),
-                   redis=redis)
+        return cls(api_key, experiment_name,
+                   results[2], traffic_fraction=float(results[3]), winner=results[4],
+                   redis=redis, is_archived=results[5], is_paused=results[6])
 
     @classmethod
-    def find_or_create(cls, experiment_name, alternatives,
+    def find_or_create(cls, api_key, experiment_name, alternatives,
         traffic_fraction=None,
         redis=None):
 
@@ -436,10 +507,10 @@ class Experiment(object):
 
         is_update = False
         try:
-            experiment = Experiment.find(experiment_name, redis=redis)
+            experiment = Experiment.find(api_key, experiment_name, redis=redis)
             is_update = True
         except ValueError:
-            experiment = cls(experiment_name, alternatives, redis=redis)
+            experiment = cls(api_key, experiment_name, alternatives, redis=redis)
             # TODO: I want to revisit this later.
             experiment.set_traffic_fraction(traffic_fraction)
             experiment.save()
@@ -458,16 +529,16 @@ class Experiment(object):
         return experiment
 
     @staticmethod
-    def all_names(redis=None):
-        return redis.smembers(_key('e'))
+    def all_names(api_key, redis=None):
+        return redis.smembers(_key('e:{0}'.format(api_key)))
 
     @staticmethod
-    def all(exclude_archived=True, exclude_paused=True, redis=None):
+    def all(api_key, exclude_archived=True, exclude_paused=True, redis=None):
         experiments = []
-        keys = redis.smembers(_key('e'))
+        keys = redis.smembers(_key('e:{0}'.format(api_key)))
 
         for key in keys:
-            experiment = Experiment.find(key, redis=redis)
+            experiment = Experiment.find(api_key, key, redis=redis)
             if experiment.is_archived() and exclude_archived:
                 continue
             if experiment.is_paused() and exclude_paused:
@@ -476,18 +547,18 @@ class Experiment(object):
         return experiments
 
     @staticmethod
-    def archived(redis=None):
-        experiments = Experiment.all(exclude_archived=False, exclude_paused=True, redis=redis)
+    def archived(api_key, redis=None):
+        experiments = Experiment.all(api_key, exclude_archived=False, exclude_paused=True, redis=redis)
         return [exp for exp in experiments if exp.is_archived()]
 
     @staticmethod
-    def paused(redis=None):
-        experiments = Experiment.all(exclude_archived=True, exclude_paused=False, redis=redis)
+    def paused(api_key, redis=None):
+        experiments = Experiment.all(api_key, exclude_archived=True, exclude_paused=False, redis=redis)
         return [exp for exp in experiments if exp.is_paused()]
 
     @staticmethod
-    def load_alternatives(experiment_name, redis=None):
-        key = _key("e:{0}:alternatives".format(experiment_name))
+    def load_alternatives(api_key, experiment_name, redis=None):
+        key = _key("e:{0}:{1}:alternatives".format(api_key, experiment_name))
         return redis.lrange(key, 0, -1)
 
     @staticmethod
@@ -570,7 +641,7 @@ class Alternative(object):
         return winner and winner.name == self.name
 
     def participant_count(self):
-        key = _key("p:{0}:{1}:all".format(self.experiment.name, self.name))
+        key = _key("p:{0}:{1}:all".format(self.experiment.name_key, self.name))
         return self.redis.bitcount(key)
 
     def participants_by_day(self):
@@ -598,7 +669,7 @@ class Alternative(object):
     def _get_stats(self, stat_type, stat_range):
         if stat_type == 'participations':
             stat_type = 'p'
-            exp_key = self.experiment.name
+            exp_key = self.experiment.name_key
         elif stat_type == 'conversions':
             stat_type = 'c'
             exp_key = self.experiment.kpi_key()
@@ -633,15 +704,13 @@ class Alternative(object):
         else:
             date = dt
 
-        experiment_key = self.experiment.name
+        experiment_key = self.experiment.name_key
 
         pipe = self.redis.pipeline()
 
         pipe.sadd(_key("p:{0}:years".format(experiment_key)), date.strftime('%Y'))
         pipe.sadd(_key("p:{0}:months".format(experiment_key)), date.strftime('%Y-%m'))
         pipe.sadd(_key("p:{0}:days".format(experiment_key)), date.strftime('%Y-%m-%d'))
-
-        pipe.execute()
 
         keys = [
             _key("p:{0}:_all:all".format(experiment_key)),
@@ -653,7 +722,10 @@ class Alternative(object):
             _key("p:{0}:{1}:{2}".format(experiment_key, self.name, date.strftime('%Y-%m'))),
             _key("p:{0}:{1}:{2}".format(experiment_key, self.name, date.strftime('%Y-%m-%d'))),
         ]
-        msetbit(keys=keys, args=([self.experiment.sequential_id(client), 1] * len(keys)))
+
+        #msetbit(keys=keys, args=([self.experiment.sequential_id(client), 1] * len(keys)))
+        pipe.eval(msetbit_script, len(keys), *(keys + [self.experiment.sequential_id(client), 1] * len(keys)))
+        pipe.execute()
 
     def record_conversion(self, client, dt=None):
         """Record a user's conversion in a test along with a given variation"""
@@ -670,8 +742,6 @@ class Alternative(object):
         pipe.sadd(_key("c:{0}:months".format(experiment_key)), date.strftime('%Y-%m'))
         pipe.sadd(_key("c:{0}:days".format(experiment_key)), date.strftime('%Y-%m-%d'))
 
-        pipe.execute()
-
         keys = [
             _key("c:{0}:_all:users:all".format(experiment_key)),
             _key("c:{0}:_all:users:{1}".format(experiment_key, date.strftime('%Y'))),
@@ -682,7 +752,10 @@ class Alternative(object):
             _key("c:{0}:{1}:users:{2}".format(experiment_key, self.name, date.strftime('%Y-%m'))),
             _key("c:{0}:{1}:users:{2}".format(experiment_key, self.name, date.strftime('%Y-%m-%d'))),
         ]
-        msetbit(keys=keys, args=([self.experiment.sequential_id(client), 1] * len(keys)))
+
+        #msetbit(keys=keys, args=([self.experiment.sequential_id(client), 1] * len(keys)))
+        pipe.eval(msetbit_script, len(keys), *(keys + [self.experiment.sequential_id(client), 1] * len(keys)))
+        pipe.execute()
 
     def conversion_rate(self):
         try:
@@ -803,7 +876,7 @@ class Alternative(object):
             return 0
 
     def key(self):
-        return _key("{0}:{1}".format(self.experiment.name, self.name))
+        return _key("{0}:{1}".format(self.experiment.name_key, self.name))
 
     @staticmethod
     def is_valid(alternative_name):

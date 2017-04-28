@@ -22,7 +22,7 @@ except ConnectionError:
     print "Redis is currently unavailable or misconfigured"
     sys.exit()
 
-from models import Experiment, Client
+from models import Experiment, APIError
 from utils import service_unavailable_on_connection_error, json_error, json_success
 
 
@@ -116,6 +116,7 @@ class Sixpack(object):
         experiment_name = request.args.get('experiment')
         client_id = request.args.get('client_id')
         kpi = request.args.get('kpi', None)
+        api_key = request.args.get('api_key', None)
 
         if client_id is None or experiment_name is None:
             return json_error({'message': 'missing arguments'}, request, 400)
@@ -125,7 +126,7 @@ class Sixpack(object):
             dt = dateutil.parser.parse(request.args.get("datetime"))
 
         try:
-            alt = convert(experiment_name, client_id, kpi=kpi, datetime=dt, redis=self.redis)
+            alt = convert(api_key, experiment_name, client_id, kpi=kpi, datetime=dt, redis=self.redis)
         except ValueError as e:
             return json_error({'message': str(e)}, request, 400)
 
@@ -152,6 +153,7 @@ class Sixpack(object):
         force = request.args.get('force')
         client_id = request.args.get('client_id')
         traffic_fraction = request.args.get('traffic_fraction')
+        api_key = request.args.get('api_key', None)
 
         if traffic_fraction is not None:
             traffic_fraction = float(traffic_fraction)
@@ -165,16 +167,16 @@ class Sixpack(object):
             dt = dateutil.parser.parse(request.args.get("datetime"))
         try:
             if should_exclude_visitor(request):
-                exp = Experiment.find(experiment_name, redis=self.redis)
+                exp = Experiment.find(api_key, experiment_name, redis=self.redis)
                 if exp.winner is not None:
                     alt = exp.winner
                 else:
                     alt = exp.control
             else:
-                alt = participate(experiment_name, alts, client_id,
+                alt = participate(api_key, experiment_name, alts, client_id,
                                   force=force, traffic_fraction=traffic_fraction,
                                   prefetch=prefetch, datetime=dt, redis=self.redis)
-        except ValueError as e:
+        except (ValueError, APIError) as e:
             return json_error({'message': str(e)}, request, 400)
 
         resp = {
