@@ -239,7 +239,7 @@ class Experiment(object):
 
     def delete(self):
         pipe = self.redis.pipeline()
-        pipe.srem(_key('e:{0}'.format(self.api_key)), self.name_key)
+        pipe.srem(_key('e:{0}'.format(self.api_key)), self.name)
         pipe.delete(self.key())
         pipe.delete(_key(self.name_key))
         pipe.delete(_key('e:{0}'.format(self.name_key)))
