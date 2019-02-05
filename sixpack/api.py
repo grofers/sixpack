@@ -39,3 +39,17 @@ def convert(api_key, experiment, client_id,
         alt = exp.control
 
     return alt
+
+
+def client_experiments(api_key, client_id,
+                       kpi=None, redis=None,
+                       exclude_paused=True,
+                       exclude_archived=True):
+    client = Client(client_id, redis=redis)
+    alternatives = []
+    running_experiments = Experiment.all(api_key, redis=redis,
+                                         exclude_paused=exclude_paused,
+                                         exclude_archived=exclude_archived)
+    for experiment in running_experiments:
+        alternatives.append(experiment.get_alternative(client))
+    return alternatives

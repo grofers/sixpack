@@ -10,7 +10,7 @@ from werkzeug.routing import Map, Rule
 from werkzeug.exceptions import HTTPException, NotFound
 
 from . import __version__
-from api import participate, convert
+from api import participate, convert, client_experiments
 
 from config import CONFIG as cfg
 from metrics import init_statsd
@@ -40,6 +40,7 @@ class Sixpack(object):
             Rule('/participate', endpoint='participate'),
             Rule('/convert', endpoint='convert'),
             Rule('/experiments/<name>', endpoint='experiment_details'),
+            Rule('/get/<client_id>', endpoint='client_experiments'),
             Rule('/favicon.ico', endpoint='favicon')
         ])
 
@@ -190,6 +191,43 @@ class Sixpack(object):
             'status': 'ok'
         }
 
+        return json_success(resp, request)
+
+    @service_unavailable_on_connection_error
+    def on_client_experiments(self, request, client_id):
+        api_key = request.args.get('api_key', None)
+        exclude_archived = False if request.args.get(
+            'exclude_archived', '').lower() == 'false' else True
+        exclude_paused = False if request.args.get(
+            'exclude_paused', '').lower() == 'false' else True
+        if client_id is None:
+            return json_error({'message': 'missing arguments'}, request, 400)
+        try:
+            experiment_alternatives = client_experiments(
+                api_key, client_id, redis=self.redis,
+                exclude_archived=exclude_archived,
+                exclude_paused=exclude_paused)
+        except (ValueError, APIError) as e:
+            return json_error({'message': str(e)}, request, 500)
+
+        if not experiment_alternatives:
+            return json_success({'experiments': []}, request)
+        experiment_info = [
+            {
+                'alternative': {
+                    'name': alt.name
+                },
+                'experiment': {
+                    'name': alt.experiment.name,
+                    'is_paused': alt.experiment.is_paused(),
+                    'is_archived': alt.experiment.is_archived()
+                },
+            }
+            for alt in experiment_alternatives
+        ]
+        resp = {
+            'experiments': experiment_info
+        }
         return json_success(resp, request)
 
     @service_unavailable_on_connection_error
