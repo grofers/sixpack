@@ -1,0 +1,4 @@
+debug = True
+timeout = 900000
+workers = 1
+worker_class = "sync"
