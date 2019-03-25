@@ -53,3 +53,9 @@ def client_experiments(api_key, client_id,
     for experiment in running_experiments:
         alternatives.append(experiment.get_alternative(client))
     return alternatives
+
+
+def experiment_user_alternatives(api_key, experiment,
+                                 redis=None, start=1, end=5000):
+    user_alternatives = experiment.client_alternatives(start, end)
+    return user_alternatives

@@ -71,3 +71,28 @@ first_key_with_bit_set_script = """
 """
 
 first_key_with_bit_set = REDIS.register_script(first_key_with_bit_set_script)
+
+
+'''
+            user_experiment_alternatives_script
+Returns the list of (sequence_id, experiment_alternative_key)
+'''
+
+user_experiment_alternatives_script = """
+    local arr = {}
+    local client = {}
+    for match in string.gmatch(ARGV[1], "[^,]+") do
+      table.insert(client, match)
+    end
+    for index, value in ipairs(KEYS) do
+        for index1, value1 in ipairs(client) do
+            local bit = redis.call('getbit', value, value1)
+            if bit == 1 then
+                table.insert(arr, {tonumber(value1), value})
+            end
+        end
+    end
+    return arr
+"""
+
+user_experiment_alternatives = REDIS.register_script(user_experiment_alternatives_script)

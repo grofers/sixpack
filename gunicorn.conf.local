@@ -2,3 +2,6 @@ debug = True
 timeout = 900000
 workers = 1
 worker_class = "sync"
+reload = True
+log_file = "gunicorn.log"
+log_level = "DEBUG"
