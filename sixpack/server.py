@@ -244,15 +244,18 @@ class Sixpack(object):
     @service_unavailable_on_connection_error
     def on_user_experiment_alternatives(self, request, name):
         api_key = request.args.get('api_key', None)
-        start = request.args.get('start') or 1
-        end = request.args.get('end') or 5000
+        start = request.args.get('sequence_id_start') or 1
+        page_size = request.args.get('page_size') or 5000
+        end = int(start) + int(page_size) - 1
         exp = Experiment.find(api_key, name, redis=self.redis)
         if exp is None:
             return json_error({'message': 'experiment not found'}, request, 404)
         user_alternatives = experiment_user_alternatives(
             api_key, exp, redis=self.redis, start=start, end=end)
         resp = {
-            'user_alternatives': user_alternatives
+            'alternatives': [
+                {'user_id': user_id, 'alternative_name': alt} for user_id, alt in user_alternatives.iteritems()
+            ]
         }
 
         return json_success(resp, request)
