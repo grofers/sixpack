@@ -10,7 +10,8 @@ from werkzeug.routing import Map, Rule
 from werkzeug.exceptions import HTTPException, NotFound
 
 from . import __version__
-from api import participate, convert, client_experiments
+from api import (participate, convert, client_experiments,
+                 experiment_user_alternatives)
 
 from config import CONFIG as cfg
 from metrics import init_statsd
@@ -41,7 +42,8 @@ class Sixpack(object):
             Rule('/convert', endpoint='convert'),
             Rule('/experiments/<name>', endpoint='experiment_details'),
             Rule('/get/<client_id>', endpoint='client_experiments'),
-            Rule('/favicon.ico', endpoint='favicon')
+            Rule('/favicon.ico', endpoint='favicon'),
+            Rule('/experiments/<name>/user_alternatives', endpoint='user_experiment_alternatives')
         ])
 
     def __call__(self, environ, start_response):
@@ -232,11 +234,31 @@ class Sixpack(object):
 
     @service_unavailable_on_connection_error
     def on_experiment_details(self, request, name):
-        exp = Experiment.find(name, redis=self.redis)
+        api_key = request.args.get('api_key', None)
+        exp = Experiment.find(api_key, name, redis=self.redis)
         if exp is None:
             return json_error({'message': 'experiment not found'}, request, 404)
 
         return json_success(exp.objectify_by_period('day', True), request)
+
+    @service_unavailable_on_connection_error
+    def on_user_experiment_alternatives(self, request, name):
+        api_key = request.args.get('api_key', None)
+        start = request.args.get('sequence_id_start') or 1
+        page_size = request.args.get('page_size') or 5000
+        end = int(start) + int(page_size) - 1
+        exp = Experiment.find(api_key, name, redis=self.redis)
+        if exp is None:
+            return json_error({'message': 'experiment not found'}, request, 404)
+        user_alternatives = experiment_user_alternatives(
+            api_key, exp, redis=self.redis, start=start, end=end)
+        resp = {
+            'alternatives': [
+                {'user_id': user_id, 'alternative_name': alt} for user_id, alt in user_alternatives.iteritems()
+            ]
+        }
+
+        return json_success(resp, request)
 
 
 def should_exclude_visitor(request):

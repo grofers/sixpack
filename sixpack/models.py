@@ -10,7 +10,7 @@ import gevent
 
 from config import CONFIG as cfg
 from db import _key, msetbit, msetbit_script, monotonic_zadd_script, sequential_id, \
-    first_key_with_bit_set_script, first_key_with_bit_set
+    first_key_with_bit_set_script, first_key_with_bit_set, user_experiment_alternatives_script
 
 # This is pretty restrictive, but we can always relax it later.
 VALID_EXPERIMENT_ALTERNATIVE_RE = re.compile(r"^[a-z0-9][a-z0-9\-_]*$", re.I)
@@ -376,7 +376,7 @@ class Experiment(object):
 
         pipe = self.redis.pipeline()
         pipe.getbit(_key("e:{0}:excluded".format(self.name_key)), self.sequential_id(client))
-        pipe.eval(first_key_with_bit_set_script, len(keys), *(keys+[self.sequential_id(client)]))
+        pipe.eval(first_key_with_bit_set_script, len(keys), *(keys + [self.sequential_id(client)]))
         results = pipe.execute()
         is_client_excluded = results[0]
 
@@ -409,6 +409,45 @@ class Experiment(object):
     def excluded_clients(self):
         key = _key("e:{0}:excluded".format(self.name_key))
         return self.redis.bitcount(key)
+
+    def associated_clients(self, start=1, end=5000):
+        '''
+            returns map of sequence_id to client_id
+            {
+                seq_id: "client_id"
+            }
+        '''
+        key = _key('e:{0}:users'.format(self.name_key))
+        result = self.redis.zrangebyscore(key, start, end, withscores=True)
+        client_seq_map = dict((int(seq_id), client_id) for client_id, seq_id in result)
+        return client_seq_map
+
+    def client_alternatives(self, start, end):
+        seq_id_client_map = self.associated_clients(start, end)
+        client_id_alternative_map = {}
+        if not seq_id_client_map:
+            return {}
+        sequence_id_list = seq_id_client_map.keys()
+        experiment_alternatives = self.get_alternative_names()
+        excluded_key = _key("e:{0}:excluded".format(self.name_key))
+        alternative_keys = [_key("p:{0}:{1}:all".format(self.name_key, alt)) for alt in experiment_alternatives]
+        keys = [excluded_key] + alternative_keys
+        sequences = ','.join(map(str, sequence_id_list))
+        sequence_alternatives_list = self.redis.eval(
+            user_experiment_alternatives_script, len(keys),
+            *(keys + [sequences])
+        )
+        if len(sequence_alternatives_list) != len(sequence_id_list):
+            raise APIError('Unable to fetch alternatives for all clients')
+        for i in range(len(sequence_alternatives_list)):
+            sequence_id, alternative_key = sequence_alternatives_list[i]
+            client_id = seq_id_client_map[sequence_id]
+            if 'excluded' in alternative_key:
+                alternative = 'excluded'
+            else:
+                alternative = alternative_key.split(':')[-2]
+            client_id_alternative_map[client_id] = alternative
+        return client_id_alternative_map
 
     def existing_alternative(self, client):
         if self.is_client_excluded(client):
